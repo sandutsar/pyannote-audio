@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2021 CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 
-from .xvector import XVectorMFCC, XVectorSincNet
+from .CyclicLR import CyclicLR
+from .ReduceLROnPlateau import ReduceLROnPlateau
 
-__all__ = ["XVectorSincNet", "XVectorMFCC"]
+__all__ = ["ReduceLROnPlateau", "CyclicLR"]

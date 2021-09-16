@@ -47,7 +47,7 @@ from pyannote.audio.pipelines.utils import (
 )
 from pyannote.audio.tasks import VoiceActivityDetection as VoiceActivityDetectionTask
 from pyannote.audio.utils.signal import Binarize
-from pyannote.core import Annotation, SlidingWindowFeature
+from pyannote.core import Annotation
 from pyannote.database.protocol import SpeakerDiarizationProtocol
 from pyannote.metrics.detection import (
     DetectionErrorRate,
@@ -120,6 +120,9 @@ class VoiceActivityDetection(Pipeline):
             (segmentation_device,) = get_devices(needs=1)
             model.to(segmentation_device)
 
+        inference_kwargs["pre_aggregation_hook"] = lambda scores: np.max(
+            scores, axis=-1, keepdims=True
+        )
         self.segmentation_inference_ = Inference(model, **inference_kwargs)
 
         #  hyper-parameters used for hysteresis thresholding
@@ -141,6 +144,8 @@ class VoiceActivityDetection(Pipeline):
             min_duration_off=self.min_duration_off,
         )
 
+    CACHED_ACTIVATIONS = "@voice_activity_detection/activations"
+
     def apply(self, file: AudioFile) -> Annotation:
         """Apply voice activity detection
 
@@ -155,19 +160,13 @@ class VoiceActivityDetection(Pipeline):
             Speech regions.
         """
 
-        segmentation = self.segmentation_inference_(file)
-
-        if segmentation.data.shape[1] == 1:
-            file["@voice_activity_detection/activation"] = segmentation
-            activation = segmentation
+        if self.training:
+            if self.CACHED_ACTIVATIONS not in file:
+                file[self.CACHED_ACTIVATIONS] = self.segmentation_inference_(file)
         else:
-            file["@voice_activity_detection/segmentation"] = segmentation
-            activation = SlidingWindowFeature(
-                np.max(segmentation.data, axis=1, keepdims=True),
-                segmentation.sliding_window,
-            )
+            file[self.CACHED_ACTIVATIONS] = self.segmentation_inference_(file)
 
-        speech = self._binarize(activation)
+        speech = self._binarize(file[self.CACHED_ACTIVATIONS])
         speech.uri = file["uri"]
         return speech
 
