@@ -27,12 +27,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from pyannote.core.utils.generators import pairwise
 
 from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
 from pyannote.audio.models.blocks.sincnet import SincNet
 from pyannote.audio.utils.params import merge_dict
-from pyannote.core.utils.generators import pairwise
 
 
 class PyanNet(Model):
@@ -61,7 +61,7 @@ class PyanNet(Model):
         i.e. two linear layers with 128 units each.
     """
 
-    SINCNET_DEFAULTS = {"stride": 1}
+    SINCNET_DEFAULTS = {"stride": 10}
     LSTM_DEFAULTS = {
         "hidden_size": 128,
         "num_layers": 2,
@@ -148,7 +148,12 @@ class PyanNet(Model):
                 2 if self.hparams.lstm["bidirectional"] else 1
             )
 
-        self.classifier = nn.Linear(in_features, len(self.specifications.classes))
+        if self.specifications.powerset:
+            out_features = self.specifications.num_powerset_classes
+        else:
+            out_features = len(self.specifications.classes)
+
+        self.classifier = nn.Linear(in_features, out_features)
         self.activation = self.default_activation()
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:

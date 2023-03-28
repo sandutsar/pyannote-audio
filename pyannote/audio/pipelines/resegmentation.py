@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2018-2021 CNRS
+# Copyright (c) 2018-2022 CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -22,22 +22,26 @@
 
 """Resegmentation pipeline"""
 
-from typing import Text
+from functools import partial
+from typing import Callable, Optional, Text, Union
 
 import numpy as np
-
-from pyannote.audio import Inference
-from pyannote.audio.core.io import AudioFile
-from pyannote.audio.core.pipeline import Pipeline
-from pyannote.audio.pipelines.utils import PipelineModel, get_devices, get_model
-from pyannote.audio.utils.permutation import permutate
-from pyannote.audio.utils.signal import Binarize
-from pyannote.core import Annotation, SlidingWindowFeature
+from pyannote.core import Annotation, Segment, SlidingWindowFeature
 from pyannote.metrics.diarization import GreedyDiarizationErrorRate
 from pyannote.pipeline.parameter import Uniform
 
+from pyannote.audio import Inference, Model
+from pyannote.audio.core.io import AudioFile
+from pyannote.audio.core.pipeline import Pipeline
+from pyannote.audio.pipelines.utils import (
+    PipelineModel,
+    SpeakerDiarizationMixin,
+    get_model,
+)
+from pyannote.audio.utils.permutation import mae_cost_func, permutate
 
-class Resegmentation(Pipeline):
+
+class Resegmentation(SpeakerDiarizationMixin, Pipeline):
     """Resegmentation pipeline
 
     This pipeline relies on a pretrained segmentation model to improve an existing diarization
@@ -47,6 +51,10 @@ class Resegmentation(Pipeline):
     Permutated local segmentations scores are then aggregated over time and postprocessed using
     hysteresis thresholding.
 
+    It can also be used with `diarization` set to "annotation" to find a good estimate of optimal
+    values for `onset`, `offset`, `min_duration_on`, and `min_duration_off` for any speaker
+    diarization pipeline based on the `segmentation` model.
+
     Parameters
     ----------
     segmentation : Model, str, or dict, optional
@@ -54,9 +62,14 @@ class Resegmentation(Pipeline):
         See pyannote.audio.pipelines.utils.get_model for supported format.
     diarization : str, optional
         File key to use as input diarization. Defaults to "diarization".
-    inference_kwargs : dict, optional
-        Keywords arguments passed to Inference.
-
+    der_variant : dict, optional
+        Optimize for a variant of diarization error rate.
+        Defaults to {"collar": 0.0, "skip_overlap": False}. This is used in `get_metric`
+        when instantiating the metric: GreedyDiarizationErrorRate(**der_variant).
+    use_auth_token : str, optional
+        When loading private huggingface.co models, set `use_auth_token`
+        to True or to a string containing your hugginface.co authentication
+        token that can be obtained by running `huggingface-cli login`
 
     Hyper-parameters
     ----------------
@@ -72,7 +85,8 @@ class Resegmentation(Pipeline):
         self,
         segmentation: PipelineModel = "pyannote/segmentation",
         diarization: Text = "diarization",
-        **inference_kwargs,
+        der_variant: dict = None,
+        use_auth_token: Union[Text, None] = None,
     ):
 
         super().__init__()
@@ -80,55 +94,68 @@ class Resegmentation(Pipeline):
         self.segmentation = segmentation
         self.diarization = diarization
 
-        # load model and send it to GPU (when available and not already on GPU)
-        model = get_model(segmentation)
-        if model.device.type == "cpu":
-            (segmentation_device,) = get_devices(needs=1)
-            model.to(segmentation_device)
+        model: Model = get_model(segmentation, use_auth_token=use_auth_token)
+        self._segmentation = Inference(model)
+        self._frames = self._segmentation.model.introspection.frames
 
-        self.audio_ = model.audio
+        self._audio = model.audio
 
         # number of speakers in output of segmentation model
-        self.num_frames_in_chunk_, self.seg_num_speakers_ = model.introspection(
-            round(model.specifications.duration * model.hparams.sample_rate)
-        )
+        self._num_speakers = len(model.specifications.classes)
 
-        # output frames as SlidingWindow instances
-        self.seg_frames_ = model.introspection.frames
+        self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
 
-        # prepare segmentation model for inference
-        inference_kwargs["window"] = "sliding"
-        inference_kwargs["skip_aggregation"] = True
-        self.seg_inference_ = Inference(model, **inference_kwargs)
+        # segmentation warm-up
+        self.warm_up = Uniform(0.0, 0.1)
 
-        #  hyper-parameters used for hysteresis thresholding
+        # hysteresis thresholding
         self.onset = Uniform(0.0, 1.0)
         self.offset = Uniform(0.0, 1.0)
 
-        # hyper-parameters used for post-processing i.e. removing short speech turns
+        # post-processing i.e. removing short speech turns
         # or filling short gaps between speech turns of one speaker
         self.min_duration_on = Uniform(0.0, 1.0)
         self.min_duration_off = Uniform(0.0, 1.0)
 
-    def initialize(self):
-        """Initialize pipeline with current set of parameters"""
+    def default_parameters(self):
+        # parameters optimized on DIHARD 3 development set
+        if self.segmentation == "pyannote/segmentation":
+            return {
+                "warm_up": 0.05,
+                "onset": 0.810,
+                "offset": 0.481,
+                "min_duration_on": 0.055,
+                "min_duration_off": 0.098,
+            }
+        raise NotImplementedError()
 
-        self._binarize = Binarize(
-            onset=self.onset,
-            offset=self.offset,
-            min_duration_on=self.min_duration_on,
-            min_duration_off=self.min_duration_off,
-        )
+    def classes(self):
+        raise NotImplementedError()
 
-    CACHED_ACTIVATIONS = "@resegmentation/activations"
+    CACHED_SEGMENTATION = "cache/segmentation/inference"
 
-    def apply(self, file: AudioFile) -> Annotation:
+    def apply(
+        self,
+        file: AudioFile,
+        diarization: Annotation = None,
+        hook: Optional[Callable] = None,
+    ) -> Annotation:
         """Apply speaker diarization
 
         Parameters
         ----------
         file : AudioFile
             Processed file.
+        diarization : Annotation, optional
+            Input diarization. Defaults to file[self.diarization].
+        hook : callable, optional
+            Callback called after each major steps of the pipeline as follows:
+                hook(step_name,      # human-readable name of current step
+                     step_artefact,  # artifact generated by current step
+                     file=file)      # file being processed
+            Time-consuming steps call `hook` multiple times with the same `step_name`
+            and additional `completed` and `total` keyword arguments usable to track
+            progress of current step.
 
         Returns
         -------
@@ -136,68 +163,99 @@ class Resegmentation(Pipeline):
             Speaker diarization
         """
 
-        if (not self.training) or (
-            self.training and self.CACHED_ACTIVATIONS not in file
-        ):
+        hook = self.setup_hook(file, hook=hook)
 
-            # output of segmentation model on each chunk
-            segmentations: SlidingWindowFeature = self.seg_inference_(file)
-
-            # number of frames in the whole file
-            num_frames_in_file = self.seg_frames_.closest_frame(
-                segmentations.sliding_window[len(segmentations) - 1].end
-            )
-
-            # turn input diarization into binary (0 or 1) activations
-            labels = file[self.diarization].labels()
-            num_clusters = len(labels)
-            y_original = np.zeros(
-                (num_frames_in_file, len(labels)), dtype=segmentations.data.dtype
-            )
-            for k, label in enumerate(labels):
-                segments = file[self.diarization].label_timeline(label)
-                for start, stop in self.seg_frames_.crop(
-                    segments, mode="center", return_ranges=True
-                ):
-                    y_original[start:stop, k] += 1
-            y_original = np.minimum(y_original, 1, out=y_original)
-            diarization = SlidingWindowFeature(y_original, self.seg_frames_)
-
-            aggregated = np.zeros((num_frames_in_file, num_clusters))
-            overlapped = np.zeros((num_frames_in_file, num_clusters))
-
-            for chunk, segmentation in segmentations:
-
-                # only consider active speakers in `segmentation`
-                active = np.max(segmentation, axis=0) > self.onset
-                if np.sum(active) == 0:
-                    continue
-                segmentation = segmentation[:, active]
-
-                local_diarization = diarization.crop(chunk)[
-                    np.newaxis, : self.num_frames_in_chunk_
-                ]
-                (permutated_segmentation,), _ = permutate(
-                    local_diarization, segmentation
+        # apply segmentation model (only if needed)
+        # output shape is (num_chunks, num_frames, local_num_speakers)
+        if self.training:
+            if self.CACHED_SEGMENTATION in file:
+                segmentations = file[self.CACHED_SEGMENTATION]
+            else:
+                segmentations = self._segmentation(
+                    file, hook=partial(hook, "segmentation", None)
                 )
-
-                start_frame = round(chunk.start / self.seg_frames_.duration)
-                aggregated[
-                    start_frame : start_frame + self.num_frames_in_chunk_
-                ] += permutated_segmentation
-                overlapped[start_frame : start_frame + self.num_frames_in_chunk_] += 1.0
-
-            speaker_activations = SlidingWindowFeature(
-                aggregated / np.maximum(overlapped, 1e-12),
-                self.seg_frames_,
-                labels=labels,
+                file[self.CACHED_SEGMENTATION] = segmentations
+        else:
+            segmentations: SlidingWindowFeature = self._segmentation(
+                file, hook=partial(hook, "segmentation", None)
             )
 
-            file[self.CACHED_ACTIVATIONS] = speaker_activations
+        hook("segmentation", segmentations)
 
-        diarization = self._binarize(file[self.CACHED_ACTIVATIONS])
-        diarization.uri = file["uri"]
-        return diarization
+        # estimate frame-level number of instantaneous speakers
+        count = self.speaker_count(
+            segmentations,
+            onset=self.onset,
+            offset=self.offset,
+            warm_up=(self.warm_up, self.warm_up),
+            frames=self._frames,
+        )
+        hook("speaker_counting", count)
+
+        # discretize original diarization
+        # output shape is (num_frames, num_speakers)
+        diarization = diarization or file[self.diarization]
+        diarization = diarization.discretize(
+            support=Segment(
+                0.0, self._audio.get_duration(file) + self._segmentation.step
+            ),
+            resolution=self._frames,
+        )
+        hook("@resegmentation/original", diarization)
+
+        # remove warm-up regions from segmentation as they are less robust
+        segmentations = Inference.trim(
+            segmentations, warm_up=(self.warm_up, self.warm_up)
+        )
+        hook("@resegmentation/trim", segmentations)
+
+        # zero-pad diarization or segmentation so they have the same number of speakers
+        _, num_speakers = diarization.data.shape
+        if num_speakers > self._num_speakers:
+            segmentations.data = np.pad(
+                segmentations.data,
+                ((0, 0), (0, 0), (0, num_speakers - self._num_speakers)),
+            )
+        elif num_speakers < self._num_speakers:
+            diarization.data = np.pad(
+                diarization.data, ((0, 0), (0, self._num_speakers - num_speakers))
+            )
+            num_speakers = self._num_speakers
+
+        # find optimal permutation with respect to the original diarization
+        permutated_segmentations = np.full_like(segmentations.data, np.NAN)
+        _, num_frames, _ = permutated_segmentations.shape
+        for c, (chunk, segmentation) in enumerate(segmentations):
+            local_diarization = diarization.crop(chunk)[np.newaxis, :num_frames]
+            (permutated_segmentations[c],), _ = permutate(
+                local_diarization,
+                segmentation,
+                cost_func=mae_cost_func,
+            )
+        permutated_segmentations = SlidingWindowFeature(
+            permutated_segmentations, segmentations.sliding_window
+        )
+        hook("@resegmentation/permutated", permutated_segmentations)
+
+        # build discrete diarization
+        discrete_diarization = self.to_diarization(permutated_segmentations, count)
+
+        # convert to continuous diarization
+        resegmentation = self.to_annotation(
+            discrete_diarization,
+            min_duration_on=self.min_duration_on,
+            min_duration_off=self.min_duration_off,
+        )
+
+        resegmentation.uri = file["uri"]
+
+        # when reference is available, use it to map hypothesized speakers
+        # to reference speakers (this makes later error analysis easier
+        # but does not modify the actual output of the resegmentation pipeline)
+        if "annotation" in file and file["annotation"]:
+            resegmentation = self.optimal_mapping(file["annotation"], resegmentation)
+
+        return resegmentation
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
-        return GreedyDiarizationErrorRate(collar=0.0, skip_overlap=False)
+        return GreedyDiarizationErrorRate(**self.der_variant)

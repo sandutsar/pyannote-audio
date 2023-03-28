@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020 CNRS
+# Copyright (c) 2020-2022 CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,19 +20,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from .multilabel import MultiLabelSegmentation
 from .overlapped_speech_detection import OverlappedSpeechDetection
 from .resegmentation import Resegmentation
-from .segmentation import Segmentation
+from .segmentation import SpeakerSegmentation
 from .speaker_diarization import SpeakerDiarization
 from .voice_activity_detection import VoiceActivityDetection
 
-# from .speech_turn_assignment import SpeechTurnClosestAssignment  # not optimizable
-# from .speech_turn_clustering import SpeechTurnClustering  #  not optimizable
-
 __all__ = [
     "VoiceActivityDetection",
-    "Segmentation",
     "OverlappedSpeechDetection",
+    "SpeakerSegmentation",
     "SpeakerDiarization",
     "Resegmentation",
+    "MultiLabelSegmentation",
 ]

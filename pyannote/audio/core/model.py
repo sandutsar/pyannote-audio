@@ -33,16 +33,17 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.optim
-from huggingface_hub import cached_download, hf_hub_url
-from pytorch_lightning.core.memory import ModelSummary
-from pytorch_lightning.utilities.cloud_io import load as pl_load
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
+from pyannote.core import SlidingWindow
+from lightning_lite.utilities.cloud_io import _load as pl_load
+from pytorch_lightning.utilities.model_summary import ModelSummary
 from semver import VersionInfo
 from torch.utils.data import DataLoader
 
 from pyannote.audio import __version__
 from pyannote.audio.core.io import Audio
 from pyannote.audio.core.task import Problem, Resolution, Specifications, Task
-from pyannote.core import SlidingWindow
 
 CACHE_DIR = os.getenv(
     "PYANNOTE_CACHE",
@@ -351,8 +352,27 @@ class Model(pl.LightningModule):
         # list of layers before adding task-dependent layers
         before = set((name, id(module)) for name, module in self.named_modules())
 
-        # add layers that depends on task specs (e.g. final classification layer)
+        # add task-dependent layers (e.g. final classification layer)
+        # and re-use original weights when compatible
+
+        original_state_dict = self.state_dict()
         self.build()
+
+        try:
+            missing_keys, unexpected_keys = self.load_state_dict(
+                original_state_dict, strict=False
+            )
+
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                msg = (
+                    "Model has been trained for a different task. For fine tuning or transfer learning, "
+                    "it is recommended to train task-dependent layers for a few epochs "
+                    f"before training the whole model: {self.task_dependent}."
+                )
+                warnings.warn(msg)
+            else:
+                raise e
 
         # move layers that were added by build() to same device as the rest of the model
         for name, module in self.named_modules():
@@ -366,10 +386,7 @@ class Model(pl.LightningModule):
             # setup custom loss function
             self.task.setup_loss_func()
             # setup custom validation metrics
-            validation_metric = self.task.setup_validation_metric()
-            if validation_metric is not None:
-                self.validation_metric = validation_metric
-                self.validation_metric.to(self.device)
+            self.task.setup_validation_metric()
 
             # this is to make sure introspection is performed here, once and for all
             _ = self.introspection
@@ -399,6 +416,10 @@ class Model(pl.LightningModule):
 
     @staticmethod
     def check_version(library: Text, theirs: Text, mine: Text):
+
+        theirs = ".".join(theirs.split(".")[:3])
+        mine = ".".join(mine.split(".")[:3])
+
         theirs = VersionInfo.parse(theirs)
         mine = VersionInfo.parse(mine)
         if theirs.major != mine.major:
@@ -516,7 +537,7 @@ class Model(pl.LightningModule):
         tokens = module_name.split(".")
         updated_modules = list()
 
-        for name, module in ModelSummary(self, mode="full").named_modules:
+        for name, module in ModelSummary(self, max_depth=-1).named_modules:
             name_tokens = name.split(".")
             matching_tokens = list(
                 token
@@ -608,7 +629,7 @@ class Model(pl.LightningModule):
         if isinstance(modules, str):
             modules = [modules]
 
-        for name, module in ModelSummary(self, mode="full").named_modules:
+        for name, module in ModelSummary(self, max_depth=-1).named_modules:
 
             if name not in modules:
                 continue
@@ -691,7 +712,6 @@ class Model(pl.LightningModule):
         map_location=None,
         hparams_file: Union[Path, Text] = None,
         strict: bool = True,
-        task: Task = None,
         use_auth_token: Union[Text, None] = None,
         cache_dir: Union[Path, Text] = CACHE_DIR,
         **kwargs,
@@ -719,8 +739,6 @@ class Model(pl.LightningModule):
         strict : bool, optional
             Whether to strictly enforce that the keys in checkpoint match
             the keys returned by this module’s state dict. Defaults to True.
-        task : Task, optional
-            Setup model for fine tuning (or transfer learning) on this task.
         use_auth_token : str, optional
             When loading a private huggingface.co model, set `use_auth_token`
             to True or to a string containing your hugginface.co authentication
@@ -764,32 +782,62 @@ class Model(pl.LightningModule):
                 model_id = checkpoint
                 revision = None
 
-            url = hf_hub_url(
-                model_id, filename=HF_PYTORCH_WEIGHTS_NAME, revision=revision
-            )
-            path_for_pl = cached_download(
-                url=url,
-                library_name="pyannote",
-                library_version=__version__,
-                cache_dir=cache_dir,
-                use_auth_token=use_auth_token,
-            )
+            try:
+                path_for_pl = hf_hub_download(
+                    model_id,
+                    HF_PYTORCH_WEIGHTS_NAME,
+                    repo_type="model",
+                    revision=revision,
+                    library_name="pyannote",
+                    library_version=__version__,
+                    cache_dir=cache_dir,
+                    # force_download=False,
+                    # proxies=None,
+                    # etag_timeout=10,
+                    # resume_download=False,
+                    use_auth_token=use_auth_token,
+                    # local_files_only=False,
+                    # legacy_cache_layout=False,
+                )
+            except RepositoryNotFoundError:
+                print(
+                    f"""
+Could not download '{model_id}' model.
+It might be because the model is private or gated so make
+sure to authenticate. Visit https://hf.co/settings/tokens to
+create your access token and retry with:
+
+   >>> Model.from_pretrained('{model_id}',
+   ...                       use_auth_token=YOUR_AUTH_TOKEN)
+
+If this still does not work, it might be because the model is gated:
+visit https://hf.co/{model_id} to accept the user conditions."""
+                )
+                return None
 
             # HACK Huggingface download counters rely on config.yaml
             # HACK Therefore we download config.yaml even though we
             # HACK do not use it. Fails silently in case model does not
             # HACK have a config.yaml file.
             try:
-                config_url = hf_hub_url(
-                    model_id, filename=HF_LIGHTNING_CONFIG_NAME, revision=revision
-                )
-                _ = cached_download(
-                    url=config_url,
+
+                _ = hf_hub_download(
+                    model_id,
+                    HF_LIGHTNING_CONFIG_NAME,
+                    repo_type="model",
+                    revision=revision,
                     library_name="pyannote",
                     library_version=__version__,
                     cache_dir=cache_dir,
+                    # force_download=False,
+                    # proxies=None,
+                    # etag_timeout=10,
+                    # resume_download=False,
                     use_auth_token=use_auth_token,
+                    # local_files_only=False,
+                    # legacy_cache_layout=False,
                 )
+
             except Exception:
                 pass
 
@@ -812,15 +860,14 @@ class Model(pl.LightningModule):
                 path_for_pl,
                 map_location=map_location,
                 hparams_file=hparams_file,
-                strict=strict if task is None else False,
+                strict=strict,
                 **kwargs,
             )
         except RuntimeError as e:
             if "loss_func" in str(e):
                 msg = (
                     "Model has been trained with a task-dependent loss function. "
-                    "Either use the 'task' argument to force setting up the loss function "
-                    "or set 'strict' to False to load the model without its loss function "
+                    "Set 'strict' to False to load the model without its loss function "
                     "and prevent this warning from appearing. "
                 )
                 warnings.warn(msg)
@@ -834,25 +881,5 @@ class Model(pl.LightningModule):
                 return model
 
             raise e
-
-        if task is not None:
-            model.task = task
-            model.setup(stage="fit")
-
-            try:
-                missing_keys, unexpected_keys = model.load_state_dict(
-                    loaded_checkpoint["state_dict"], strict=strict
-                )
-            except RuntimeError as e:
-                if "size mismatch" in str(e):
-                    msg = (
-                        "Model has been trained for a different task. For fine tuning or transfer learning, "
-                        "it is recommended to train task-dependent layers for a few epochs "
-                        f"before training the whole model: {model.task_dependent}."
-                    )
-                    warnings.warn(msg)
-                    return model
-
-                raise e
 
         return model

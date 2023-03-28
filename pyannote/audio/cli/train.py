@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2020-2022 CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -26,68 +26,71 @@ from typing import Optional
 
 import hydra
 from hydra.utils import instantiate
+from lightning_lite.utilities.seed import seed_everything
 from omegaconf import DictConfig, OmegaConf
+
+# from pyannote.audio.core.callback import GraduallyUnfreeze
+from pyannote.database import FileFinder, registry
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
+    RichProgressBar,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.seed import seed_everything
 from torch_audiomentations.utils.config import from_dict as get_augmentation
 
-# from pyannote.audio.core.callback import GraduallyUnfreeze
-from pyannote.database import FileFinder, get_protocol
+from pyannote.audio.core.io import get_torchaudio_info
 
 
 @hydra.main(config_path="train_config", config_name="config")
-def main(cfg: DictConfig) -> Optional[float]:
-
-    if cfg.trainer.get("resume_from_checkpoint", None) is not None:
-        raise ValueError(
-            "trainer.resume_from_checkpoint is not supported. "
-            "use model=pretrained model.checkpoint=... instead."
-        )
+def train(cfg: DictConfig) -> Optional[float]:
 
     # make sure to set the random seed before the instantiation of Trainer
     # so that each model initializes with the same weights when using DDP.
     seed = int(os.environ.get("PL_GLOBAL_SEED", "0"))
     seed_everything(seed=seed)
 
-    protocol = get_protocol(cfg.protocol, preprocessors={"audio": FileFinder()})
+    # load databases into registry
+    for database_yml in cfg.registry.split(","):
+        registry.load_database(database_yml)
 
-    # TODO: configure layer freezing
+    # instantiate training protocol with optional preprocessors
+    preprocessors = {"audio": FileFinder(), "torchaudio.info": get_torchaudio_info}
+    if "preprocessor" in cfg:
+        preprocessor = instantiate(cfg.preprocessor)
+        preprocessors[preprocessor.preprocessed_key] = preprocessor
+    protocol = registry.get_protocol(cfg.protocol, preprocessors=preprocessors)
 
-    # TODO: remove this OmegaConf.to_container hack once bug is solved:
-    # https://github.com/omry/omegaconf/pull/443
+    # instantiate data augmentation
     augmentation = (
         get_augmentation(OmegaConf.to_container(cfg.augmentation))
         if "augmentation" in cfg
         else None
     )
+    if augmentation is not None:
+        augmentation.output_type = "dict"
 
     # instantiate task and validation metric
     task = instantiate(cfg.task, protocol, augmentation=augmentation)
-    monitor, direction = task.val_monitor
 
     # instantiate model
-    pretrained = cfg.model["_target_"] == "pyannote.audio.cli.pretrained"
-    model = instantiate(cfg.model, task=task)
+    fine_tuning = cfg.model["_target_"] == "pyannote.audio.cli.pretrained"
+    model = instantiate(cfg.model)
+    model.task = task
+    model.setup(stage="fit")
 
-    if not pretrained:
-        # add task-dependent layers so that later call to model.parameters()
-        # does return all layers (even task-dependent ones). this is already
-        # done for pretrained models (TODO: check that this is true)
-        model.setup(stage="fit")
+    # validation metric to monitor (and its direction: min or max)
+    monitor, direction = task.val_monitor
 
     # number of batches in one epoch
     num_batches_per_epoch = model.task.train__len__() // model.task.batch_size
 
+    # configure optimizer and scheduler
     def configure_optimizers(self):
-
         optimizer = instantiate(cfg.optimizer, self.parameters())
         lr_scheduler = instantiate(
-            cfg.lr_scheduler,
+            cfg.scheduler,
             optimizer,
             monitor=monitor,
             direction=direction,
@@ -97,21 +100,19 @@ def main(cfg: DictConfig) -> Optional[float]:
 
     model.configure_optimizers = MethodType(configure_optimizers, model)
 
-    callbacks = []
+    callbacks = [RichProgressBar(), LearningRateMonitor(logging_interval="step")]
 
-    # # TODO: replace by finetune_scheduler config
-    # if pretrained:
-    #     # for fine-tuning and/or transfer learning, we start by fitting
-    #     # task-dependent layers and gradully unfreeze more layers
-    #     callbacks.append(GraduallyUnfreeze(epochs_per_stage=1))
-
-    learning_rate_monitor = LearningRateMonitor()
-    callbacks.append(learning_rate_monitor)
+    if fine_tuning:
+        # TODO: configure layer freezing
+        # TODO: for fine-tuning and/or transfer learning, we start by fitting
+        # TODO: task-dependent layers and gradully unfreeze more layers
+        # TODO: callbacks.append(GraduallyUnfreeze(epochs_per_stage=1))
+        pass
 
     checkpoint = ModelCheckpoint(
         monitor=monitor,
         mode=direction,
-        save_top_k=None if monitor is None else 5,
+        save_top_k=None if monitor is None else 1,
         every_n_epochs=1,
         save_last=True,
         save_weights_only=False,
@@ -126,22 +127,25 @@ def main(cfg: DictConfig) -> Optional[float]:
             monitor=monitor,
             mode=direction,
             min_delta=0.0,
-            patience=cfg.lr_scheduler.patience * 2,
+            patience=100,
             strict=True,
             verbose=False,
         )
         callbacks.append(early_stopping)
 
-    logger = TensorBoardLogger(
-        ".",
-        name="",
-        version="",
-        log_graph=False,  # TODO: fixes onnx error with asteroid-filterbanks
-    )
+    # instantiate logger
+    logger = TensorBoardLogger(".", name="", version="", log_graph=False)
 
-    # TODO: defaults to one-GPU training (one GPU is available)
-
+    # instantiate trainer
     trainer = instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
+
+    # in case of fine-tuning, validate the initial model to make sure
+    # that we actually improve over the initial performance
+    if fine_tuning:
+        model.setup(stage="fit")
+        trainer.validate(model)
+
+    # train the model
     trainer.fit(model)
 
     # save paths to best models
@@ -158,4 +162,4 @@ def main(cfg: DictConfig) -> Optional[float]:
 
 
 if __name__ == "__main__":
-    main()
+    train()

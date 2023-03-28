@@ -1,128 +1,133 @@
-# Neural speaker diarization
+# Neural speaker diarization with `pyannote.audio`
 
-This is the development branch of upcoming `pyannote.audio` 2.0 for which it has been decided to rewrite almost everything from scratch.  Highlights of this upcoming release will be:
+`pyannote.audio` is an open-source toolkit written in Python for speaker diarization. Based on [PyTorch](pytorch.org) machine learning framework, it provides a set of trainable end-to-end neural building blocks that can be combined and jointly optimized to build speaker diarization pipelines.
 
-- a much smaller and cleaner codebase
-- Python-first API (the *good old* pyannote-audio CLI will still be available, though)
-- multi-GPU and TPU training thanks to [pytorch-lightning](https://pytorchlightning.ai/)
-- data augmentation with [torch-audiomentations](https://github.com/asteroid-team/torch-audiomentations)
-- [huggingface](https://huggingface.co/pyannote) model hosting
-- [prodigy](https://prodi.gy) recipes for audio annotations
-- online [demo](https://huggingface.co/spaces/pyannote/segmentation) based on [streamlit](https://www.streamlit.io)
+<p align="center">
+ <a href="https://www.youtube.com/watch?v=37R_R82lfwA"><img src="https://img.youtube.com/vi/37R_R82lfwA/0.jpg"></a>
+</p>
+
+
+## TL;DR [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pyannote/pyannote-audio/blob/develop/tutorials/intro.ipynb)
+
+
+```python
+# 1. visit hf.co/pyannote/speaker-diarization and hf.co/pyannote/segmentation and accept user conditions (only if requested)
+# 2. visit hf.co/settings/tokens to create an access token (only if you had to go through 1.)
+# 3. instantiate pretrained speaker diarization pipeline
+from pyannote.audio import Pipeline
+pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization",
+                                    use_auth_token="ACCESS_TOKEN_GOES_HERE")
+
+# 4. apply pretrained pipeline
+diarization = pipeline("audio.wav")
+
+# 5. print the result
+for turn, _, speaker in diarization.itertracks(yield_label=True):
+    print(f"start={turn.start:.1f}s stop={turn.end:.1f}s speaker_{speaker}")
+# start=0.2s stop=1.5s speaker_0
+# start=1.8s stop=3.9s speaker_1
+# start=4.2s stop=5.7s speaker_0
+# ...
+```
+
+## What's new in `pyannote.audio` 2.x?
+
+For version 2.x of `pyannote.audio`, [I](https://herve.niderb.fr) decided to rewrite almost everything from scratch.
+Highlights of this release are:
+
+- :exploding_head: much better performance (see [Benchmark](#benchmark))
+- :snake: Python-first API
+- :hugs: pretrained [pipelines](https://hf.co/models?other=pyannote-audio-pipeline) (and [models](https://hf.co/models?other=pyannote-audio-model)) on [:hugs: model hub](https://huggingface.co/pyannote)
+- :zap: multi-GPU training with [pytorch-lightning](https://pytorchlightning.ai/)
+- :control_knobs: data augmentation with [torch-audiomentations](https://github.com/asteroid-team/torch-audiomentations)
+- :boom: [Prodigy](https://prodi.gy/) recipes for model-assisted audio annotation
 
 ## Installation
 
+Only Python 3.8+ is officially supported (though it might work with Python 3.7)
+
 ```bash
-conda create -n pyannote python=3.8.5
+conda create -n pyannote python=3.8
 conda activate pyannote
 
-# pyannote.audio relies on torchaudio's soundfile backend, itself relying
-# on libsndfile, sometimes tricky to install. This seems to work fine but
-# is provided with no guarantee of success:
-conda install numpy cffi
-conda install libsndfile=1.0.28 -c conda-forge
+# pytorch 1.11 is required for speechbrain compatibility
+# (see https://pytorch.org/get-started/previous-versions/#v1110)
+conda install pytorch==1.11.0 torchvision==0.12.0 torchaudio==0.11.0 -c pytorch
 
-# until a proper release of pyannote.audio 2.x is available on PyPI,
-# install from the `develop` branch:
-pip install https://github.com/pyannote/pyannote-audio/archive/develop.zip
+pip install pyannote.audio
 ```
 
-## pyannote.audio 101
+## Documentation
 
-*For now, this is the closest you can get to an actual documentation.*
+- [Changelog](CHANGELOG.md)
+- [Frequently asked questions](FAQ.md)
+- Models
+    - Available tasks explained
+    - [Applying a pretrained model](tutorials/applying_a_model.ipynb)
+    - [Training, fine-tuning, and transfer learning](tutorials/training_a_model.ipynb)
+- Pipelines
+    - Available pipelines explained
+    - [Applying a pretrained pipeline](tutorials/applying_a_pipeline.ipynb)
+    - [Adapting a pretrained pipeline to your own data](tutorials/adapting_pretrained_pipeline.ipynb)
+    - [Training a pipeline](tutorials/voice_activity_detection.ipynb)
+- Contributing
+    - [Adding a new model](tutorials/add_your_own_model.ipynb)
+    - [Adding a new task](tutorials/add_your_own_task.ipynb)
+    - Adding a new pipeline
+    - Sharing pretrained models and pipelines
+- Blog
+    - 2022-12-02 > ["How I reached 1st place at Ego4D 2022, 1st place at Albayzin 2022, and 6th place at VoxSRC 2022 speaker diarization challenges"](tutorials/adapting_pretrained_pipeline.ipynb)
+    - 2022-10-23 > ["One speaker segmentation model to rule them all"](https://herve.niderb.fr/fastpages/2022/10/23/One-speaker-segmentation-model-to-rule-them-all)
+    - 2021-08-05 > ["Streaming voice activity detection with pyannote.audio"](https://herve.niderb.fr/fastpages/2021/08/05/Streaming-voice-activity-detection-with-pyannote.html)
+- Miscellaneous
+    - [Training with `pyannote-audio-train` command line tool](tutorials/training_with_cli.md)
+    - [Annotating your own data with Prodigy](tutorials/prodigy.md)
+    - [Speaker verification](tutorials/speaker_verification.ipynb)
+    - Visualization and debugging
 
-Experimental protocol is reproducible thanks to [`pyannote.database`](https://github.com/pyannote/pyannote-database).
-*Here, we use the [AMI](https://github.com/pyannote/AMI-diarization-setup) "only_words" speaker diarization protocol.*
+## Benchmark
 
-```python
-from pyannote.database import get_protocol
-ami = get_protocol('AMI.SpeakerDiarization.only_words')
+Out of the box, `pyannote.audio` default speaker diarization [pipeline](https://hf.co/pyannote/speaker-diarization) is expected to be much better (and faster) in v2.x than in v1.1. Those numbers are diarization error rates (in %)
+
+| Dataset \ Version      | v1.1 | v2.0 | v2.1.1 (finetuned) |
+| ---------------------- | ---- | ---- | ------------------ |
+| AISHELL-4              | -    | 14.6 | 14.1 (14.5)        |
+| AliMeeting (channel 1) | -    | -    | 27.4 (23.8)        |
+| AMI (IHM)              | 29.7 | 18.2 | 18.9 (18.5)        |
+| AMI (SDM)              | -    | 29.0 | 27.1 (22.2)        |
+| CALLHOME (part2)       | -    | 30.2 | 32.4 (29.3)        |
+| DIHARD 3 (full)        | 29.2 | 21.0 | 26.9 (21.9)        |
+| VoxConverse (v0.3)     | 21.5 | 12.6 | 11.2 (10.7)        |
+| REPERE (phase2)        | -    | 12.6 | 8.2 ( 8.3)         |
+| This American Life     | -    | -    | 20.8 (15.2)        |
+
+## Citations
+
+If you use `pyannote.audio` please use the following citations:
+
+```bibtex
+@inproceedings{Bredin2020,
+  Title = {{pyannote.audio: neural building blocks for speaker diarization}},
+  Author = {{Bredin}, Herv{\'e} and {Yin}, Ruiqing and {Coria}, Juan Manuel and {Gelly}, Gregory and {Korshunov}, Pavel and {Lavechin}, Marvin and {Fustes}, Diego and {Titeux}, Hadrien and {Bouaziz}, Wassim and {Gill}, Marie-Philippe},
+  Booktitle = {ICASSP 2020, IEEE International Conference on Acoustics, Speech, and Signal Processing},
+  Year = {2020},
+}
 ```
 
-Data augmentation is supported via [`torch-audiomentations`](https://github.com/asteroid-team/torch-audiomentations).
-
-```python
-from torch_audiomentations import Compose, ApplyImpulseResponse, AddBackgroundNoise
-augmentation = Compose(transforms=[ApplyImpulseResponse(...),
-                                   AddBackgroundNoise(...)])
+```bibtex
+@inproceedings{Bredin2021,
+  Title = {{End-to-end speaker segmentation for overlap-aware resegmentation}},
+  Author = {{Bredin}, Herv{\'e} and {Laurent}, Antoine},
+  Booktitle = {Proc. Interspeech 2021},
+  Year = {2021},
+}
 ```
 
-A growing collection of tasks can be addressed.
-*Here, we address speaker segmentation.*
+## Support
 
-```python
-from pyannote.audio.tasks import Segmentation
-seg = Segmentation(ami, augmentation=augmentation)
-```
+For commercial enquiries and scientific consulting, please contact [me](mailto:herve@niderb.fr).
 
-A growing collection of model architecture can be used.
-*Here, we use the PyanNet (sincnet + LSTM) architecture.*
-
-```python
-from pyannote.audio.models.segmentation import PyanNet
-model = PyanNet(task=seg)
-```
-
-We benefit from all the nice things that [`pytorch-lightning`](https://www.pytorchlightning.ai/) has to offer:  distributed (GPU & TPU) training, model checkpointing, logging, etc.
-*In this example, we don't really use any of this...*
-
-```python
-from pytorch_lightning import Trainer
-trainer = Trainer()
-trainer.fit(model)
-```
-
-Predictions are obtained by wrapping the model into the `Inference` engine.
-
-```python
-from pyannote.audio import Inference
-inference = Inference(model)
-predictions = inference('audio.wav')
-```
-
-Pretrained models can be shared on [Huggingface.co](https://huggingface.co/pyannote) model hub.
-*Here, we download and use a [pretrained](https://huggingface.co/pyannote/segmentation) segmentation model.*
-
-```python
-inference = Inference('pyannote/segmentation')
-predictions = inference('audio.wav')
-```
-
-Fine-tuning is as easy as setting the `task` attribute, freezing early layers and training.
-*Here, we fine-tune on AMI dataset the pretrained segmentation model.*
-
-```python
-from pyannote.audio import Model
-model = Model.from_pretrained('pyannote/segmentation')
-model.task = Segmentation(ami)
-model.freeze_up_to('sincnet')
-trainer.fit(model)
-```
-
-Transfer learning is also supported out of the box.
-*Here, we do transfer learning from segmentation to overlapped speech detection.*
-
-```python
-from pyannote.audio.tasks import OverlappedSpeechDetection
-osd = OverlappedSpeechDetection(ami)
-model.task = osd
-trainer.fit(model)
-```
-
-Default optimizer (`Adam` with default parameters) is automatically set up for you.  Customizing optimizer (and scheduler) requires overriding [`model.configure_optimizers`](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.core.lightning.html#pytorch_lightning.core.lightning.LightningModule.configure_optimizers) method:
-
-```python
-from types import MethodType
-from torch.optim import SGD
-from torch.optim.lr_scheduler import ExponentialLR
-def configure_optimizers(self):
-    return {"optimizer": SGD(self.parameters()),
-            "lr_scheduler": ExponentialLR(optimizer, 0.9)}
-model.configure_optimizers = MethodType(configure_optimizers, model)
-trainer.fit(model)
-```
-
-## Contributing
+## Development
 
 The commands below will setup pre-commit hooks and packages needed for developing the `pyannote.audio` library.
 
@@ -130,8 +135,6 @@ The commands below will setup pre-commit hooks and packages needed for developin
 pip install -e .[dev,testing]
 pre-commit install
 ```
-
-## Testing
 
 Tests rely on a set of debugging files available in [`test/data`](test/data) directory.
 Set `PYANNOTE_DATABASE_CONFIG` environment variable to `test/data/database.yml` before running tests:

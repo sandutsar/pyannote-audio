@@ -23,7 +23,7 @@
 from typing import List, Mapping, Text, Union
 
 from pytorch_lightning import Callback, Trainer
-from pytorch_lightning.core.memory import ModelSummary
+from pytorch_lightning.utilities.model_summary import ModelSummary
 
 from pyannote.audio import Model
 
@@ -86,7 +86,7 @@ class GraduallyUnfreeze(Callback):
         task_specific_layers = model.task_dependent
         backbone_layers = [
             layer
-            for layer, _ in reversed(ModelSummary(model, mode="top").named_modules)
+            for layer, _ in reversed(ModelSummary(model, max_depth=1).named_modules)
             if layer not in task_specific_layers
         ]
 

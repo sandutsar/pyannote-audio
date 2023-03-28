@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2021 CNRS
+# Copyright (c) 2020- CNRS
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,20 +20,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import itertools
 import math
 import random
 import warnings
-from typing import List, Optional, Text, Tuple
+from typing import Dict, Optional, Sequence, Text, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
-from torchmetrics import AUROC
-from typing_extensions import Literal
+import torch
+import torch.nn.functional
+from pyannote.core import Segment, SlidingWindowFeature
+from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger
+from torch.utils.data._utils.collate import default_collate
+from torchmetrics import Metric
+from torchmetrics.classification import BinaryAUROC, MulticlassAUROC, MultilabelAUROC
 
-from pyannote.audio.core.io import Audio, AudioFile
+from pyannote.audio.core.io import AudioFile
 from pyannote.audio.core.task import Problem
+from pyannote.audio.utils.powerset import Powerset
 from pyannote.audio.utils.random import create_rng_for_worker
-from pyannote.core import Annotation, Segment, SlidingWindow, SlidingWindowFeature
 
 
 class SegmentationTaskMixin:
@@ -87,6 +93,7 @@ class SegmentationTaskMixin:
                         f"which we do not know how to handle."
                     )
                     warnings.warn(msg)
+
                 file[key] = value
 
             self._train.append(file)
@@ -120,45 +127,41 @@ class SegmentationTaskMixin:
 
         random.shuffle(self._validation)
 
-    def setup_validation_metric(self):
-        """Setup default validation metric
+    def setup_loss_func(self):
+        if self.specifications.powerset:
+            self.model.powerset = Powerset(
+                len(self.specifications.classes),
+                self.specifications.powerset_max_classes,
+            )
 
-        Use macro-average of area under the ROC curve
-        """
+    def default_metric(
+        self,
+    ) -> Union[Metric, Sequence[Metric], Dict[str, Metric]]:
+        """Returns macro-average of the area under the ROC curve"""
 
-        if self.specifications.problem in [
-            Problem.BINARY_CLASSIFICATION,
-            Problem.MULTI_LABEL_CLASSIFICATION,
-        ]:
-            num_classes = 1
+        num_classes = len(self.specifications.classes)
+        if self.specifications.problem == Problem.BINARY_CLASSIFICATION:
+            return BinaryAUROC(compute_on_cpu=True)
+        elif self.specifications.problem == Problem.MULTI_LABEL_CLASSIFICATION:
+            return MultilabelAUROC(num_classes, average="macro", compute_on_cpu=True)
+        elif self.specifications.problem == Problem.MONO_LABEL_CLASSIFICATION:
+            return MulticlassAUROC(num_classes, average="macro", compute_on_cpu=True)
         else:
-            num_classes = len(self.specifications.classes)
+            raise RuntimeError(
+                f"The {self.specifications.problem} problem type hasn't been given a default segmentation metric yet."
+            )
 
-        return AUROC(num_classes, pos_label=1, average="macro", compute_on_step=False)
-
-    def prepare_y(self, one_hot_y: np.ndarray) -> np.ndarray:
+    def adapt_y(self, one_hot_y: np.ndarray) -> np.ndarray:
         raise NotImplementedError(
-            f"{self.__class__.__name__} must implement the `prepare_y` method."
+            f"{self.__class__.__name__} must implement the `adapt_y` method."
         )
-
-    @property
-    def chunk_labels(self) -> Optional[List[Text]]:
-        """Ordered list of labels
-
-        Override this method to make `prepare_chunk` use a specific
-        ordered list of labels when extracting frame-wise labels.
-
-        See `prepare_chunk` source code for details.
-        """
-        return None
 
     def prepare_chunk(
         self,
         file: AudioFile,
         chunk: Segment,
         duration: float = None,
-        stage: Literal["train", "val"] = "train",
-    ) -> Tuple[np.ndarray, np.ndarray, List[Text]]:
+    ) -> dict:
         """Extract audio chunk and corresponding frame-wise labels
 
         Parameters
@@ -169,8 +172,6 @@ class SegmentationTaskMixin:
             Audio chunk.
         duration : float, optional
             Fix chunk duration to avoid rounding errors. Defaults to self.duration
-        stage : {"train", "val"}
-            "train" for training step, "val" for validation step
 
         Returns
         -------
@@ -178,82 +179,26 @@ class SegmentationTaskMixin:
             Dictionary with the following keys:
             X : np.ndarray
                 Audio chunk as (num_samples, num_channels) array.
-            y : np.ndarray
+            y : SlidingWindowFeature
                 Frame-wise labels as (num_frames, num_labels) array.
-            ...
+
         """
 
         sample = dict()
 
-        # ==================================================================
-        # X = "audio" crop
-        # ==================================================================
-
-        sample["X"], _ = self.model.audio.crop(
-            file,
-            chunk,
-            mode="center",
-            fixed=self.duration if duration is None else duration,
-        )
-
-        # ==================================================================
-        # y = "annotation" crop (with corresponding "labels")
-        # ==================================================================
+        # read (and resample if needed) audio chunk
+        duration = duration or self.duration
+        sample["X"], _ = self.model.audio.crop(file, chunk, duration=duration)
 
         # use model introspection to predict how many frames it will output
         num_samples = sample["X"].shape[1]
         num_frames, _ = self.model.introspection(num_samples)
+        resolution = duration / num_frames
 
-        # crop "annotation" and keep track of corresponding list of labels if needed
-        annotation: Annotation = file["annotation"].crop(chunk)
-        labels = annotation.labels() if self.chunk_labels is None else self.chunk_labels
-
-        y = np.zeros((num_frames, len(labels)), dtype=np.int8)
-        frames = SlidingWindow(
-            start=chunk.start,
-            duration=self.duration / num_frames,
-            step=self.duration / num_frames,
+        # discretize annotation, using model resolution
+        sample["y"] = file["annotation"].discretize(
+            support=chunk, resolution=resolution, duration=duration
         )
-        for label in annotation.labels():
-            try:
-                k = labels.index(label)
-            except ValueError:
-                warnings.warn(
-                    f"File {file['uri']} contains unexpected label '{label}'."
-                )
-                continue
-
-            segments = annotation.label_timeline(label)
-            for start, stop in frames.crop(segments, mode="center", return_ranges=True):
-                y[start:stop, k] += 1
-
-        # handle corner case when the same label is active more than once
-        sample["y"] = np.minimum(y, 1, out=y)
-        sample["labels"] = labels
-
-        # ==================================================================
-        # additional metadata
-        # ==================================================================
-
-        for key, value in file.items():
-
-            # those keys were already dealt with
-            if key in ["audio", "annotation", "annotated"]:
-                pass
-
-            # replace text-like entries by their integer index
-            elif isinstance(value, Text):
-                try:
-                    sample[key] = self._train_metadata[key].index(value)
-                except ValueError as e:
-                    if stage == "val":
-                        sample[key] = -1
-                    else:
-                        raise e
-
-            # crop score-like entries
-            elif isinstance(value, SlidingWindowFeature):
-                sample[key] = value.crop(chunk, fixed=duration, mode="center")
 
         return sample
 
@@ -304,7 +249,7 @@ class SegmentationTaskMixin:
             start_time = rng.uniform(segment.start, segment.end - self.duration)
             chunk = Segment(start_time, start_time + self.duration)
 
-            yield self.prepare_chunk(file, chunk, duration=self.duration, stage="train")
+            yield self.prepare_chunk(file, chunk, duration=self.duration)
 
     def train__iter__(self):
         """Iterate over training samples
@@ -325,12 +270,6 @@ class SegmentationTaskMixin:
         rng = create_rng_for_worker(self.model.current_epoch)
 
         balance = getattr(self, "balance", None)
-        overlap = getattr(self, "overlap", dict())
-        overlap_probability = overlap.get("probability", 0.0)
-        if overlap_probability > 0:
-            overlap_snr_min = overlap.get("snr_min", 0.0)
-            overlap_snr_max = overlap.get("snr_max", 0.0)
-
         if balance is None:
             chunks = self.train__iter__helper(rng)
 
@@ -347,94 +286,72 @@ class SegmentationTaskMixin:
                 chunks = chunks_by_domain[domain]
 
             # generate random chunk
-            sample = next(chunks)
+            yield next(chunks)
 
-            if rng.random() > overlap_probability:
-                try:
-                    sample["y"] = self.prepare_y(sample["y"])
-                except ValueError:
-                    # if a ValueError is raised by prepare_y, skip this sample.
+    def collate_X(self, batch) -> torch.Tensor:
+        return default_collate([b["X"] for b in batch])
 
-                    # see pyannote.audio.tasks.segmentation.Segmentation.prepare_y
-                    # to understand why this might happen.
-                    continue
+    def collate_y(self, batch) -> torch.Tensor:
 
-                _ = sample.pop("labels")
-                yield sample
-                continue
+        # gather common set of labels
+        # b["y"] is a SlidingWindowFeature instance
+        labels = sorted(set(itertools.chain(*(b["y"].labels for b in batch))))
+        num_labels = len(labels)
 
-            # generate another random chunk
-            other_sample = next(chunks)
+        batch_size = len(batch)
+        num_frames = len(batch[0]["y"])
 
-            # sum both chunks with random SNR
-            random_snr = (
-                overlap_snr_max - overlap_snr_min
-            ) * rng.random() + overlap_snr_min
-            alpha = np.exp(-np.log(10) * random_snr / 20)
-            combined_X = Audio.power_normalize(
-                sample["X"]
-            ) + alpha * Audio.power_normalize(other_sample["X"])
+        if num_labels == 0:
+            return torch.from_numpy(
+                np.zeros((batch_size, num_frames, 1), dtype=np.int64)
+            )
 
-            # combine labels
-            y, labels = sample["y"], sample.pop("labels")
-            other_y, other_labels = other_sample["y"], other_sample.pop("labels")
-            y_mapping = {label: i for i, label in enumerate(labels)}
-            num_combined_labels = len(y_mapping)
-            for label in other_labels:
-                if label not in y_mapping:
-                    y_mapping[label] = num_combined_labels
-                    num_combined_labels += 1
-            # combined_labels = [
-            #     label
-            #     for label, _ in sorted(y_mapping.items(), key=lambda item: item[1])
-            # ]
+        Y = np.zeros((batch_size, num_frames, num_labels), dtype=np.int64)
+        for i, b in enumerate(batch):
+            for local_idx, label in enumerate(b["y"].labels):
+                global_idx = labels.index(label)
+                Y[i, :, global_idx] = b["y"].data[:, local_idx]
 
-            # combine targets
-            combined_y = np.zeros_like(y, shape=(len(y), num_combined_labels))
-            for i, label in enumerate(labels):
-                combined_y[:, y_mapping[label]] += y[:, i]
-            for i, label in enumerate(other_labels):
-                combined_y[:, y_mapping[label]] += other_y[:, i]
+        return torch.from_numpy(Y)
 
-            # handle corner case when the same label is active at the same time in both chunks
-            combined_y = np.minimum(combined_y, 1, out=combined_y)
+    def adapt_y(self, collated_y: torch.Tensor) -> torch.Tensor:
+        return collated_y
 
-            try:
-                combined_y = self.prepare_y(combined_y)
-            except ValueError:
-                # if a ValueError is raised by prepare_y, skip this sample.
+    def collate_fn(self, batch, stage="train"):
+        """Collate function used for most segmentation tasks
 
-                # see pyannote.audio.tasks.segmentation.Segmentation.prepare_y
-                # to understand why this might happen.
-                continue
+        This function does the following:
+        * stack waveforms into a (batch_size, num_channels, num_samples) tensor batch["X"])
+        * apply augmentation when in "train" stage
+        * convert targets into a (batch_size, num_frames, num_classes) tensor batch["y"]
+        * collate any other keys that might be present in the batch using pytorch default_collate function
 
-            combined_sample = {
-                "X": combined_X,
-                "y": combined_y,
-            }
+        Parameters
+        ----------
+        batch : list of dict
+            List of training samples.
 
-            for key, value in sample.items():
+        Returns
+        -------
+        batch : dict
+            Collated batch as {"X": torch.Tensor, "y": torch.Tensor} dict.
+        """
 
-                # those keys were already dealt with
-                if key in ["X", "y"]:
-                    pass
+        # collate X
+        collated_X = self.collate_X(batch)
 
-                # text-like entries have been replaced by their integer index in prepare_chunk.
-                # we (somewhat arbitrarily) combine i and j into i + j x (num_values + 1) to avoid
-                # any conflict with pure i or pure j samples
-                elif isinstance(value, int):
-                    combined_sample[key] = sample[key] + other_sample[key] * (
-                        len(self._train_metadata[key]) + 1
-                    )
+        # collate y
+        collated_y = self.collate_y(batch)
 
-                # score-like entries have been chunked into numpy array in prepare_chunk
-                # we (somewhat arbitrarily) average them using the same alpha as for X
-                elif isinstance(value, np.ndarray):
-                    combined_sample[key] = (sample[key] + alpha * other_sample[key]) / (
-                        1 + alpha
-                    )
+        # apply augmentation (only in "train" stage)
+        self.augmentation.train(mode=(stage == "train"))
+        augmented = self.augmentation(
+            samples=collated_X,
+            sample_rate=self.model.hparams.sample_rate,
+            targets=collated_y.unsqueeze(1),
+        )
 
-            yield combined_sample
+        return {"X": augmented.samples, "y": self.adapt_y(augmented.targets.squeeze(1))}
 
     def train__len__(self):
         # Number of training samples in one epoch
@@ -443,16 +360,10 @@ class SegmentationTaskMixin:
 
     def val__getitem__(self, idx):
         f, chunk = self._validation[idx]
-        sample = self.prepare_chunk(f, chunk, duration=self.duration, stage="val")
-        sample["y"] = self.prepare_y(sample["y"])
-        _ = sample.pop("labels")
-        return sample
+        return self.prepare_chunk(f, chunk, duration=self.duration)
 
     def val__len__(self):
         return len(self._validation)
-
-    def validation_postprocess(self, y, y_pred):
-        return y_pred
 
     def validation_step(self, batch, batch_idx: int):
         """Compute validation area under the ROC curve
@@ -473,13 +384,12 @@ class SegmentationTaskMixin:
         _, num_frames, _ = y_pred.shape
         # y_pred = (batch_size, num_frames, num_classes)
 
-        # postprocess
-        y_pred = self.validation_postprocess(y, y_pred)
+        # compute warmup frames boundaries and weight
+        warm_up_left = round(self.warm_up[0] / self.duration * num_frames)
+        warm_up_right = round(self.warm_up[1] / self.duration * num_frames)
 
         # - remove warm-up frames
         # - downsample remaining frames
-        warm_up_left = round(self.warm_up[0] / self.duration * num_frames)
-        warm_up_right = round(self.warm_up[1] / self.duration * num_frames)
         preds = y_pred[:, warm_up_left : num_frames - warm_up_right : 10]
         target = y[:, warm_up_left : num_frames - warm_up_right : 10]
 
@@ -487,40 +397,37 @@ class SegmentationTaskMixin:
         # pyannote.audio is more explicit so we have to reshape target and preds for
         # torchmetrics to be happy... more details can be found here:
         # https://torchmetrics.readthedocs.io/en/latest/references/modules.html#input-types
-
         if self.specifications.problem == Problem.BINARY_CLASSIFICATION:
             # target: shape (batch_size, num_frames), type binary
             # preds:  shape (batch_size, num_frames, 1), type float
 
             # torchmetrics expects:
-            # target: shape (N,), type binary
-            # preds:  shape (N,), type float
+            # target: shape (batch_size,), type binary
+            # preds:  shape (batch_size,), type float
 
-            self.model.validation_metric(preds.reshape(-1), target.reshape(-1))
+            self.model.validation_metric(
+                preds.reshape(-1),
+                target.reshape(-1),
+            )
 
         elif self.specifications.problem == Problem.MULTI_LABEL_CLASSIFICATION:
             # target: shape (batch_size, num_frames, num_classes), type binary
             # preds:  shape (batch_size, num_frames, num_classes), type float
 
             # torchmetrics expects
-            # target: shape (N, ), type binary
-            # preds:  shape (N, ), type float
+            # target: shape (batch_size, num_classes, ...), type binary
+            # preds:  shape (batch_size, num_classes, ...), type float
 
-            self.model.validation_metric(preds.reshape(-1), target.reshape(-1))
+            self.model.validation_metric(
+                torch.transpose(preds, 1, 2),
+                torch.transpose(target, 1, 2),
+            )
 
         elif self.specifications.problem == Problem.MONO_LABEL_CLASSIFICATION:
-            # target: shape (batch_size, num_frames, num_classes), type binary
-            # preds:  shape (batch_size, num_frames, num_classes), type float
-
-            # torchmetrics expects:
-            # target: shape (N, ), type int
-            # preds:  shape (N, num_classes), type float
-
             # TODO: implement when pyannote.audio gets its first mono-label segmentation task
             raise NotImplementedError()
 
-        self.model.log(
-            f"{self.ACRONYM}@val_auroc",
+        self.model.log_dict(
             self.model.validation_metric,
             on_step=False,
             on_epoch=True,
@@ -536,7 +443,7 @@ class SegmentationTaskMixin:
         ):
             return
 
-        # visualize first 9 validation samples of first batch in Tensorboard
+        # visualize first 9 validation samples of first batch in Tensorboard/MLflow
         X = X.cpu().numpy()
         y = y.float().cpu().numpy()
         y_pred = y_pred.cpu().numpy()
@@ -546,10 +453,10 @@ class SegmentationTaskMixin:
         nrows = math.ceil(math.sqrt(num_samples))
         ncols = math.ceil(num_samples / nrows)
         fig, axes = plt.subplots(
-            nrows=3 * nrows, ncols=ncols, figsize=(15, 10), squeeze=False
+            nrows=2 * nrows, ncols=ncols, figsize=(8, 5), squeeze=False
         )
 
-        # reshape target so that there is one line per class when plottingit
+        # reshape target so that there is one line per class when plotting it
         y[y == 0] = np.NaN
         if len(y.shape) == 2:
             y = y[:, :, np.newaxis]
@@ -562,16 +469,8 @@ class SegmentationTaskMixin:
             row_idx = sample_idx // nrows
             col_idx = sample_idx % ncols
 
-            # plot waveform
-            ax_wav = axes[row_idx * 3 + 0, col_idx]
-            sample_X = np.mean(X[sample_idx], axis=0)
-            ax_wav.plot(sample_X)
-            ax_wav.set_xlim(0, len(sample_X))
-            ax_wav.get_xaxis().set_visible(False)
-            ax_wav.get_yaxis().set_visible(False)
-
             # plot target
-            ax_ref = axes[row_idx * 3 + 1, col_idx]
+            ax_ref = axes[row_idx * 2 + 0, col_idx]
             sample_y = y[sample_idx]
             ax_ref.plot(sample_y)
             ax_ref.set_xlim(0, len(sample_y))
@@ -579,8 +478,8 @@ class SegmentationTaskMixin:
             ax_ref.get_xaxis().set_visible(False)
             ax_ref.get_yaxis().set_visible(False)
 
-            # plot prediction
-            ax_hyp = axes[row_idx * 3 + 2, col_idx]
+            # plot predictions
+            ax_hyp = axes[row_idx * 2 + 1, col_idx]
             sample_y_pred = y_pred[sample_idx]
             ax_hyp.axvspan(0, warm_up_left, color="k", alpha=0.5, lw=0)
             ax_hyp.axvspan(
@@ -593,13 +492,16 @@ class SegmentationTaskMixin:
 
         plt.tight_layout()
 
-        self.model.logger.experiment.add_figure(
-            f"{self.ACRONYM}@val_samples", fig, self.model.current_epoch
-        )
+        for logger in self.model.loggers:
+            if isinstance(logger, TensorBoardLogger):
+                logger.experiment.add_figure(
+                    f"{self.logging_prefix}ValSamples", fig, self.model.current_epoch
+                )
+            elif isinstance(logger, MLFlowLogger):
+                logger.experiment.log_figure(
+                    run_id=logger.run_id,
+                    figure=fig,
+                    artifact_file=f"{self.logging_prefix}ValSamples_epoch{self.model.current_epoch}.png",
+                )
 
         plt.close(fig)
-
-    @property
-    def val_monitor(self):
-        """Maximize validation area under ROC curve"""
-        return f"{self.ACRONYM}@val_auroc", "max"
